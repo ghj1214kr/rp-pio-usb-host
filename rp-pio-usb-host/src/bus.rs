@@ -4,11 +4,11 @@
 //! reset, and low-/full-speed keep-alives. Higher-level adapters can build control,
 //! bulk, and interrupt transfers on top of these primitives.
 
-use crate::frame_counter::FrameCounter;
 use crate::pio_instance::UsbPioInstance;
 use crate::ram::now_us;
 use crate::rx_driver::{RxDriver, RxPacketStatus};
 use crate::tx_driver::TxDriver;
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use embassy_rp::Peri;
 use embassy_rp::interrupt::typelevel::Binding;
 use embassy_rp::pio::{Common, Instance, InterruptHandler, Pin, Pio, PioPin};
@@ -18,9 +18,11 @@ use embassy_usb_driver::host::{DeviceEvent, PipeError};
 
 /// Root-port reset SE0 duration.
 ///
-/// USB 2.0 §7.1.7.5 "Reset Signaling" (T_DRST, table 7-14) requires at least
-/// 10 ms of SE0; 15 ms leaves some margin.
-const RESET_SE0_US: u64 = 15_000;
+/// USB 2.0 §7.1.7.5 "Reset Signaling": a reset from a *root port* lasts at least
+/// 50 ms (T_DRSTR, table 7-14); the 10–20 ms T_DRST applies to downstream hub ports.
+/// The longer reset gives a suspended device time to wake and finish the high-speed
+/// detection handshake before falling back to full speed.
+const RESET_SE0_US: u64 = 50_000;
 
 /// Reset-recovery hold: after releasing reset, emit SOF-only frames (no transactions)
 /// for this many frames before talking to the device. USB 2.0 §7.1.7.5 reset-recovery
@@ -39,29 +41,6 @@ const DEBOUNCE_FRAMES: u32 = 15;
 /// than the time spent plugged in, before we consider it "detached".
 const DEBOUNCE_CAP: u32 = 60;
 
-/// `control_out` STATUS-stage IN polls before giving up.
-///
-/// Devices may NAK the write-status IN while processing requests such as
-/// `SET_CONFIGURATION`; retrying the whole transfer too early restarts the request.
-const STATUS_POLL_ATTEMPTS: u32 = 400;
-
-/// Maximum CRC errors tolerated during a STATUS-stage IN poll loop.
-///
-/// A separate budget from NAK retries lets us distinguish a noisy/broken link
-/// (many CRC failures) from a device that is simply busy (many NAKs).
-const STATUS_CRC_ERROR_BUDGET: u32 = 8;
-
-/// `control_in` DATA-stage NAK-poll budget per packet.
-///
-/// The budget resets after each successfully received packet so a slow multi-packet
-/// descriptor cannot spend the entire allowance before later packets are ready.
-const DATA_STALL_BUDGET: u32 = 64;
-
-/// Absolute `control_in` poll cap for the whole DATA stage.
-///
-/// This bounds devices that keep returning full-size packets or NAK forever.
-const DATA_TOTAL_CAP: u32 = 400;
-
 /// Full-speed frame interval in microseconds.
 ///
 /// USB 2.0 §7.1.12 and §8.4.3 define one full-speed frame every 1.000 ms
@@ -69,6 +48,38 @@ const DATA_TOTAL_CAP: u32 = 400;
 /// period, and retry cadence. The bus-idle test uses the RAM-safe [`now_us`]
 /// helper because it runs in the synchronous transaction path.
 const FRAME_INTERVAL_US: u32 = 1000;
+
+/// Minimum spacing between two SOFs.
+///
+/// SOFs are aligned to 1 ms timer slots; if one goes out late in its slot, the next
+/// slot's SOF is held back until at least this long after it.
+const MIN_SOF_SPACING_US: u32 = FRAME_INTERVAL_US / 2;
+
+/// End-of-frame guard: a transaction is not started within this many microseconds
+/// of the next frame boundary.
+///
+/// Covers the longest full-speed transaction this host issues: token, turnaround,
+/// a 64-byte DATA packet with worst-case bit stuffing (~53 µs), and the handshake.
+const FRAME_GUARD_US: u32 = 80;
+
+/// Continuous idle (J) that marks the end of a device packet. Inside a packet the line
+/// holds a state for at most 7 bit times (0.6 µs at full speed).
+const BUS_IDLE_US: u32 = 2;
+
+/// Upper bound for [`Bus::settle_after_bad_reply`]: longer than a maximum-size
+/// full-speed packet with worst-case bit stuffing (~56 µs).
+const BUS_IDLE_TIMEOUT_US: u32 = 100;
+
+/// Timer slot of the most recent SOF, readable without the bus lock.
+///
+/// Lets the frame-timer interrupt tell, when a transfer holds the bus at a frame
+/// boundary, whether that transfer already sent the frame's SOF. One global: there is
+/// one frame alarm (`embassy::FRAME_ALARM`), so one bus uses the frame timer.
+pub(crate) static LAST_SOF_SLOT: AtomicU32 = AtomicU32::new(u32::MAX);
+
+/// Set while the root port is held in reset (SE0): no SOF can be sent, so the
+/// frame-timer interrupt does not retry.
+pub(crate) static SOF_PAUSED: AtomicBool = AtomicBool::new(false);
 
 /// Pull-down configuration for the USB bus.
 ///
@@ -135,8 +146,20 @@ pub struct Bus<'a, PIO: UsbPioInstance> {
     /// Timestamp of the last SOF packet sent, in microseconds from [`now_us`].
     ///
     /// For FS devices, we need to send one SOF frame every millisecond,
-    /// *if* the bus is not busy at the moment.
+    /// including while a transfer is in progress (see [`Self::sof_if_due`]).
     last_sof: u32,
+
+    /// 1 ms timer slot (`now_us / 1000`) of the last SOF sent; its low 11 bits are the
+    /// frame number.
+    sof_slot: u32,
+
+    /// PIO state machine 3, until handed to [`Self::enable_hw_sof`].
+    #[cfg(any(feature = "rp235xa", feature = "rp235xb"))]
+    sof_sm: Option<embassy_rp::pio::StateMachine<'a, PIO, 3>>,
+
+    /// Hardware-timed SOF, once enabled.
+    #[cfg(any(feature = "rp235xa", feature = "rp235xb"))]
+    hw_sof: Option<crate::hw_sof::HwSof<'a, PIO>>,
 
     /// Scratch buffer for the NRZI/bit-stuff encoder.
     enc: [u8; crate::encoding::MAX_ENCODED_PACKET_BYTES],
@@ -178,8 +201,11 @@ impl<'a, PIO: UsbPioInstance> Bus<'a, PIO> {
             sm0: tx_sm,
             sm1: rx_det_sm,
             sm2: rx_dec_sm,
+            sm3: sof_sm,
             ..
         } = Pio::new(pio, irq0);
+        #[cfg(not(any(feature = "rp235xa", feature = "rp235xb")))]
+        let _ = sof_sm;
 
         // Convert GPIO peripherals into PIO-owned pins before configuring pads.
         let mut dp = common.make_pio_pin(dp);
@@ -191,6 +217,15 @@ impl<'a, PIO: UsbPioInstance> Bus<'a, PIO> {
         };
         dp.set_pull(pulldown_cfg);
         dm.set_pull(pulldown_cfg);
+
+        // Full-speed drivers must switch in 4–20 ns into the ~45 Ω single-ended cable
+        // impedance (USB 2.0 §7.1.2). The pad reset default (2/4 mA, slow slew) is too
+        // weak for that; use the strongest setting, as Pico-PIO-USB does
+        // (`port_pin_drive_setting`).
+        for pin in [&mut dp, &mut dm] {
+            pin.set_drive_strength(embassy_rp::gpio::Drive::_12mA);
+            pin.set_slew_rate(embassy_rp::gpio::SlewRate::Fast);
+        }
 
         // The PIO programs are written for inverted line sense.
         // Most of the interesting states are SE0 (both low) and J/K (one high, one low).
@@ -222,9 +257,89 @@ impl<'a, PIO: UsbPioInstance> Bus<'a, PIO> {
             debounce: 0,
             last_activity: now,
             last_sof: now,
+            sof_slot: now / FRAME_INTERVAL_US,
             enc: [0u8; crate::encoding::MAX_ENCODED_PACKET_BYTES],
             tx,
             rx,
+            #[cfg(any(feature = "rp235xa", feature = "rp235xb"))]
+            sof_sm: Some(sof_sm),
+            #[cfg(any(feature = "rp235xa", feature = "rp235xb"))]
+            hw_sof: None,
+        }
+    }
+
+    /// Switch to hardware-timed SOFs (see [`crate::hw_sof`]) using PIO state machine 3,
+    /// `pwm` and `dma`. Once only; later calls return without effect.
+    #[cfg(any(feature = "rp235xa", feature = "rp235xb"))]
+    pub(crate) fn enable_hw_sof<S: embassy_rp::pwm::Slice, C: embassy_rp::dma::ChannelInstance>(
+        &mut self,
+        pwm: Peri<'a, S>,
+        dma: Peri<'a, C>,
+    ) {
+        let Some(sm) = self.sof_sm.take() else {
+            return;
+        };
+        self.hw_sof = Some(crate::hw_sof::HwSof::new(sm, pwm, dma));
+        if self.attached && self.speed == Speed::Full {
+            self.hw_sof_arm(true);
+        }
+    }
+
+    /// Whether SOFs are currently sent by the hardware path.
+    #[inline(always)]
+    fn hw_sof_active(&self) -> bool {
+        #[cfg(any(feature = "rp235xa", feature = "rp235xb"))]
+        {
+            self.hw_sof.as_ref().is_some_and(|h| h.armed())
+        }
+        #[cfg(not(any(feature = "rp235xa", feature = "rp235xb")))]
+        {
+            false
+        }
+    }
+
+    /// Arm / disarm the hardware SOF (no-op without one).
+    fn hw_sof_arm(&mut self, on: bool) {
+        #[cfg(any(feature = "rp235xa", feature = "rp235xb"))]
+        if let Some(h) = self.hw_sof.as_mut() {
+            h.arm(on, self.tx.config());
+            if on {
+                h.service(self.tx.start_instr());
+            }
+        }
+        #[cfg(not(any(feature = "rp235xa", feature = "rp235xb")))]
+        let _ = on;
+    }
+
+    /// Prepare the next hardware SOF if due (no-op without one).
+    #[inline(always)]
+    fn hw_sof_service(&mut self) {
+        #[cfg(any(feature = "rp235xa", feature = "rp235xb"))]
+        if let Some(h) = self.hw_sof.as_mut() {
+            h.service(self.tx.start_instr());
+        }
+    }
+
+    /// Microseconds into the current frame, from the hardware SOF timebase.
+    #[inline(always)]
+    fn hw_frame_pos_us(&self) -> u32 {
+        #[cfg(any(feature = "rp235xa", feature = "rp235xb"))]
+        if let Some(h) = self.hw_sof.as_ref() {
+            return h.frame_pos_us();
+        }
+        now_us() % FRAME_INTERVAL_US
+    }
+
+    /// Hardware-SOF frame guard: no token before this frame's SOF is out, none within
+    /// [`FRAME_GUARD_US`] of the next boundary.
+    #[inline(always)]
+    fn hw_frame_guard(&self) {
+        #[cfg(any(feature = "rp235xa", feature = "rp235xb"))]
+        loop {
+            let pos = self.hw_frame_pos_us();
+            if pos >= crate::hw_sof::SOF_DONE_US && FRAME_INTERVAL_US - pos >= FRAME_GUARD_US {
+                break;
+            }
         }
     }
 
@@ -246,16 +361,57 @@ impl<'a, PIO: UsbPioInstance> Bus<'a, PIO> {
     }
 
     fn set_speed(&mut self, speed: Speed) {
+        // Re-armed by the next bus reset if the new speed is full speed.
+        self.hw_sof_arm(false);
         self.speed = speed;
         self.tx.set_speed(speed);
         self.rx.set_speed(speed);
     }
 
-    /// Drive a single SOF frame (keep-alive). Advances the internal frame counter.
-    fn sof(&mut self, frame: u16) {
-        self.last_sof = now_us();
-        let sof = crate::encoding::build_sof(frame);
-        self.tx.transmit(&sof);
+    /// Send the full-speed SOF for the current 1 ms frame if it has not been sent yet.
+    ///
+    /// Frames are slots of the hardware microsecond timer (`now_us / 1000`), so the mean
+    /// SOF period is exactly 1 ms regardless of executor latency, and the 11-bit frame
+    /// number is the slot index. Called from the idle keep-alive *and* before every
+    /// token, so a long control transfer (many NAK polls, or several transfers issued
+    /// back to back without yielding) keeps emitting SOFs.
+    ///
+    /// USB 2.0 §8.4.3.1: the host issues an SOF at the start of every full-speed frame,
+    /// whether or not other traffic keeps the bus busy.
+    fn sof_if_due(&mut self) {
+        if !self.attached || self.speed != Speed::Full {
+            return;
+        }
+        let now = now_us();
+        let slot = now / FRAME_INTERVAL_US;
+        // The spacing guard stops a late SOF at the end of one slot from being followed
+        // almost immediately by the next slot's SOF.
+        let gap = now.wrapping_sub(self.last_sof);
+        if slot != self.sof_slot && gap >= MIN_SOF_SPACING_US {
+            self.sof_slot = slot;
+            self.last_sof = now;
+            LAST_SOF_SLOT.store(slot, Ordering::Relaxed);
+            let sof = crate::encoding::build_sof((slot & 0x7ff) as u16);
+            self.tx.transmit(&sof);
+        }
+    }
+
+    /// Do not start a transaction that could still be on the wire at the next frame
+    /// boundary; wait for the boundary instead so the SOF goes out on time (the host's
+    /// end-of-frame guard, USB 2.0 §11.2.5).
+    ///
+    /// This also means the frame-timer interrupt (see `Bus::start_frame_timer`) never
+    /// lands in the middle of a transaction's reply/handshake turnaround.
+    #[inline(always)]
+    fn wait_frame_guard(&self) {
+        if !self.attached || self.speed != Speed::Full {
+            return;
+        }
+        let now = now_us();
+        if FRAME_INTERVAL_US - now % FRAME_INTERVAL_US < FRAME_GUARD_US {
+            let slot = now / FRAME_INTERVAL_US;
+            while now_us() / FRAME_INTERVAL_US == slot {}
+        }
     }
 
     /// Low-speed keep-alive: send a single low-speed **EOP** via the TX player. Encoding
@@ -274,23 +430,31 @@ impl<'a, PIO: UsbPioInstance> Bus<'a, PIO> {
         self.mark_activity();
     }
 
-    pub(crate) fn keepalive(&mut self, frame: u16) {
+    /// Emit the SOF / low-speed keep-alive if one is due.
+    ///
+    /// Returns the number of microseconds until the next one is due, so the idle task can
+    /// sleep exactly until the next frame boundary.
+    pub(crate) fn keepalive(&mut self) -> u32 {
         if !self.attached {
-            return;
+            return FRAME_INTERVAL_US;
         }
 
         match self.speed {
+            Speed::Full if self.hw_sof_active() => {
+                self.hw_sof_service();
+                FRAME_INTERVAL_US - self.hw_frame_pos_us()
+            }
             Speed::Full => {
-                if now_us().wrapping_sub(self.last_sof) >= FRAME_INTERVAL_US {
-                    self.sof(frame)
-                }
+                self.sof_if_due();
+                FRAME_INTERVAL_US - now_us() % FRAME_INTERVAL_US
             }
             Speed::Low => {
                 if now_us().wrapping_sub(self.last_activity) >= FRAME_INTERVAL_US {
                     self.ls_keepalive()
                 }
+                FRAME_INTERVAL_US.saturating_sub(now_us().wrapping_sub(self.last_activity))
             }
-            _ => (), // only FS and LS are supported by the PIO host transport
+            _ => FRAME_INTERVAL_US, // only FS and LS are supported by the PIO host transport
         }
     }
 
@@ -319,6 +483,7 @@ impl<'a, PIO: UsbPioInstance> Bus<'a, PIO> {
 
         if self.attached && self.debounce == 0 && speed.is_none() {
             self.attached = false;
+            self.hw_sof_arm(false);
             self.tx.release_bus();
             return Some(DeviceEvent::Disconnected);
         }
@@ -331,14 +496,21 @@ impl<'a, PIO: UsbPioInstance> Bus<'a, PIO> {
         Timer::after_micros(FRAME_INTERVAL_US as u64).await;
     }
 
-    pub(crate) async fn bus_reset(&mut self, frame_counter: &FrameCounter) {
+    pub(crate) async fn bus_reset(&mut self) {
+        SOF_PAUSED.store(true, Ordering::Relaxed);
+        // The hardware SOF's state machine must not write the pins over the SE0.
+        self.hw_sof_arm(false);
         self.tx.drive_reset_se0();
         Timer::after(Duration::from_micros(RESET_SE0_US)).await;
         self.tx.release_reset();
+        SOF_PAUSED.store(false, Ordering::Relaxed);
+        if self.speed == Speed::Full {
+            self.hw_sof_arm(true);
+        }
 
         for _ in 0..RESET_RECOVERY_FRAMES {
-            self.keepalive(frame_counter.next());
-            Self::wait_for_next_frame().await;
+            let next_us = self.keepalive();
+            Timer::after_micros(u64::from(next_us)).await;
         }
     }
 
@@ -364,9 +536,13 @@ impl<'a, PIO: UsbPioInstance> Bus<'a, PIO> {
         self.transmit_for_reply(in_tok, None);
         let (n, status, ack_sent) = self.receive_data_and_ack(pkt);
         if status == RxPacketStatus::Overflow {
+            self.settle_after_bad_reply();
             return Err(PipeError::Babble);
         }
         if n < 2 {
+            if n == 1 {
+                self.settle_after_bad_reply();
+            }
             return Ok(InReply::NoReply);
         }
 
@@ -380,14 +556,45 @@ impl<'a, PIO: UsbPioInstance> Bus<'a, PIO> {
                 if ack_sent && valid_crc {
                     self.tx.wait();
                 }
+                if !valid_crc {
+                    self.settle_after_bad_reply();
+                }
                 Ok(InReply::Data {
                     pid,
                     valid_crc,
                     payload_len: n.saturating_sub(4),
                 })
             }
-            _ => Ok(InReply::Other),
+            _ => {
+                self.settle_after_bad_reply();
+                Ok(InReply::Other)
+            }
         }
+    }
+
+    /// After a reply the receiver could not take in whole (bad CRC, cut short, unknown
+    /// PID), the device may still be transmitting: wait until the line has been idle for
+    /// [`BUS_IDLE_US`] before anything else goes on the bus (the next token, or the SOF
+    /// from the frame-timer interrupt once the bus lock is released).
+    ///
+    /// Transmitting over a device packet is a collision; a hub between host and device
+    /// sees its port still busy at the end of the frame and disables it (babble/LOA,
+    /// USB 2.0 §11.8.1).
+    fn settle_after_bad_reply(&mut self) {
+        let start = now_us();
+        let mut idle_since = start;
+        loop {
+            let now = now_us();
+            if self.detect_speed() != Some(self.speed) {
+                idle_since = now;
+            } else if now.wrapping_sub(idle_since) >= BUS_IDLE_US {
+                break;
+            }
+            if now.wrapping_sub(start) >= BUS_IDLE_TIMEOUT_US {
+                break;
+            }
+        }
+        self.mark_activity();
     }
 
     /// Transmit one or two packets, then arm RX for the device reply.
@@ -403,6 +610,15 @@ impl<'a, PIO: UsbPioInstance> Bus<'a, PIO> {
     /// and [`transmit_and_check_ack`](Self::transmit_and_check_ack).
     #[inline(always)]
     fn transmit_for_reply_inner(&mut self, first: &[u32], second: Option<&[u32]>) {
+        // Before the token, not between token and reply: the reply turnaround is the
+        // timing-critical part.
+        if self.hw_sof_active() {
+            self.hw_frame_guard();
+            self.hw_sof_service();
+        } else {
+            self.wait_frame_guard();
+            self.sof_if_due();
+        }
         self.rx.prepare_for_receive();
         self.tx.transmit(first);
         if let Some(second) = second {
@@ -427,12 +643,19 @@ impl<'a, PIO: UsbPioInstance> Bus<'a, PIO> {
         let (hlen, _) = self.rx.receive(&mut hbuf);
         self.mark_activity();
         if hlen < 2 {
+            if hlen == 1 {
+                self.settle_after_bad_reply();
+            }
             return Ok(false);
         }
         match hbuf[1] {
             crate::pid::USB_PID_ACK => Ok(true),
             crate::pid::USB_PID_STALL => Err(PipeError::Stall),
-            _ => Ok(false),
+            crate::pid::USB_PID_NAK => Ok(false),
+            _ => {
+                self.settle_after_bad_reply();
+                Ok(false)
+            }
         }
     }
 
@@ -531,7 +754,12 @@ impl<'a, PIO: UsbPioInstance> Bus<'a, PIO> {
     }
 
     /// Send the SETUP token and DATA0 setup packet, expecting an ACK handshake.
-    fn control_setup(&mut self, addr: u8, ep: u8, setup: &[u8; 8]) -> Result<(), PipeError> {
+    pub(crate) fn control_setup(
+        &mut self,
+        addr: u8,
+        ep: u8,
+        setup: &[u8; 8],
+    ) -> Result<(), PipeError> {
         let setup_tok = crate::encoding::build_token(crate::pid::USB_PID_SETUP, addr, ep);
         let mut data0 = [0u8; crate::encoding::MAX_DATA_PACKET_BYTES];
         let mut data_w = [0u32; crate::encoding::MAX_DATA_PACKET_WORDS];
@@ -551,188 +779,60 @@ impl<'a, PIO: UsbPioInstance> Bus<'a, PIO> {
         }
     }
 
-    /// Execute one control-IN transfer and copy the DATA stage into `data`.
+    /// One DATA-stage IN poll of a control-IN transfer.
     ///
-    /// Sends SETUP, polls IN packets until the requested length or a short packet is
-    /// received, ACKs each valid DATA packet, then completes the status OUT stage.
-    /// Returns the number of payload bytes copied into `data`.
-    pub(crate) fn control_in(
+    /// `Ok(Some(n))`: DATA with the expected toggle, ACKed; its payload is `out[..n]`.
+    /// `Ok(None)`: NAK, no reply, an undecodable packet, or a repeat of the previous
+    /// packet (wrong toggle, ACKed again): poll again later, the stage is unchanged.
+    ///
+    /// Retrying (and giving up) is the caller's job; see `embassy::PioPipe`.
+    pub(crate) fn control_data_in(
         &mut self,
         addr: u8,
         ep: u8,
-        mps: u16,
-        setup: &[u8; 8],
-        data: &mut [u8],
-    ) -> Result<usize, PipeError> {
-        // wLength from the SETUP request: the data stage also ends once this many bytes
-        // are received (not only on a short packet) — essential when the configured `mps`
-        // doesn't match the device's real mps0 (e.g. the bootstrap device-descriptor read
-        // at mps=8, where the device's single 18-byte packet is never "< mps").
-        let wlen = u16::from_le_bytes([setup[6], setup[7]]) as usize;
-        if wlen > data.len() {
-            return Err(PipeError::BufferOverflow);
-        }
-
-        // Build + encode the fixed packets for this transfer.
+        expect_data1: bool,
+        out: &mut [u8],
+    ) -> Result<Option<usize>, PipeError> {
         let in_tok = crate::encoding::build_token(crate::pid::USB_PID_IN, addr, ep);
-
-        self.control_setup(addr, ep, setup)?;
-
-        // ---- DATA-IN stage: poll IN, ACK each DATA, accumulate until short. ----
-        let mut total = 0usize;
-        let mut expect_data1 = true; // first data packet of a control-IN is DATA1
         let mut pkt = [0u8; crate::encoding::MAX_DATA_PACKET_BYTES];
-        let mut completed = wlen == 0;
-        // Each packet gets its own NAK-poll budget, reset on a received packet;
-        // DATA_TOTAL_CAP bounds a device that never sends a short packet.
-        let mut stall_polls = 0u32;
-        let mut total_polls = 0u32;
-        loop {
-            if stall_polls >= DATA_STALL_BUDGET || total_polls >= DATA_TOTAL_CAP || completed {
-                break;
-            }
-            stall_polls += 1;
-            total_polls += 1;
-
-            let (is_data1, payload_len) = match self.in_reply(&in_tok, &mut pkt)? {
-                InReply::NoReply => continue,
-                InReply::Data {
-                    pid: crate::pid::USB_PID_DATA0,
-                    valid_crc: true,
-                    payload_len,
-                } => (false, payload_len),
-                InReply::Data {
-                    pid: crate::pid::USB_PID_DATA1,
-                    valid_crc: true,
-                    payload_len,
-                } => (true, payload_len),
-                InReply::Data {
-                    valid_crc: false, ..
-                } => continue,
-                _ => continue,
-            };
-
-            if is_data1 == expect_data1 {
-                if total + payload_len > data.len() {
+        match self.in_reply(&in_tok, &mut pkt)? {
+            InReply::Data {
+                pid,
+                valid_crc: true,
+                payload_len,
+            } => {
+                if (pid == crate::pid::USB_PID_DATA1) != expect_data1 {
+                    return Ok(None);
+                }
+                if payload_len > out.len() {
                     return Err(PipeError::BufferOverflow);
                 }
-                for i in 0..payload_len {
-                    data[total] = pkt[2 + i];
-                    total += 1;
-                }
-                expect_data1 = !expect_data1;
-                stall_polls = 0; // progress — give the next packet a fresh budget
-                if payload_len < mps as usize || total >= wlen {
-                    completed = true;
-                }
+                out[..payload_len].copy_from_slice(&pkt[2..2 + payload_len]);
+                Ok(Some(payload_len))
             }
+            InReply::Nak | InReply::NoReply | InReply::Data { .. } | InReply::Other => Ok(None),
         }
-
-        if !completed {
-            return Err(PipeError::Timeout);
-        }
-
-        // ---- STATUS stage: host sends OUT + zero-length DATA1, expects ACK. ----
-        for _ in 0..DATA_STALL_BUDGET {
-            if self.out_once(addr, ep, true, &[])? {
-                return Ok(total);
-            }
-        }
-        Err(PipeError::Timeout)
     }
 
-    /// One **control-OUT** transfer: SETUP(token + DATA0 request) → optional OUT **data
-    /// stage** → STATUS (host IN → device returns a zero-length DATA1 → host ACK).
+    /// One STATUS-stage IN poll of a control-OUT transfer (the device returns a
+    /// zero-length DATA1).
     ///
-    /// With `data` empty this is a no-data control write (`SET_ADDRESS`,
-    /// `SET_CONFIGURATION`, HID `SET_IDLE`/`SET_PROTOCOL`, hub port features). With `data`
-    /// non-empty it is a control write *with* an OUT data stage — e.g. HID `SET_REPORT`.
-    /// The data stage starts on the **DATA1** toggle and is split into `mps`-sized packets;
-    /// each is retried on NAK. The control STATUS stage of a write is always an **IN**
-    /// (device returns a ZLP), regardless of whether there was an OUT data stage.
-    pub(crate) fn control_out(
-        &mut self,
-        addr: u8,
-        ep: u8,
-        mps: u16,
-        setup: &[u8; 8],
-        data: &[u8],
-    ) -> Result<(), PipeError> {
+    /// `Ok(true)`: status received, ACKed. `Ok(false)`: NAK (the device is still
+    /// processing the request), no reply or an undecodable packet: poll again later.
+    /// USB 2.0 §8.5.3.1 mandates DATA1; DATA0 is accepted too, for non-compliant devices.
+    pub(crate) fn control_status_in(&mut self, addr: u8, ep: u8) -> Result<bool, PipeError> {
         let in_tok = crate::encoding::build_token(crate::pid::USB_PID_IN, addr, ep);
-
-        // ---- SETUP stage. ----
-        self.control_setup(addr, ep, setup)?;
-
-        // ---- OUT data stage (control write with data): DATA1, DATA0, … per `mps`. ----
-        if !data.is_empty() {
-            let mps = mps.max(1) as usize;
-            let mut toggle_data1 = true; // first control-OUT data packet is DATA1
-            let mut off = 0usize;
-            while off < data.len() {
-                let end = (off + mps).min(data.len());
-                let chunk = &data[off..end];
-                let mut acked = false;
-                for _ in 0..DATA_STALL_BUDGET {
-                    if self.out_once(addr, ep, toggle_data1, chunk)? {
-                        acked = true;
-                        break;
-                    }
-                    // NAK / no handshake — device busy, retry this same packet/toggle.
-                }
-                if !acked {
-                    return Err(PipeError::Timeout);
-                }
-                toggle_data1 = !toggle_data1;
-                off = end;
-            }
-        }
-
-        // ---- STATUS stage: IN → device sends zero-length DATA1 → host ACK. ----
-        // Poll the STATUS IN *persistently* (not just a few times): a device NAKs the
-        // status IN while it completes the request — SET_CONFIGURATION on a multi-interface
-        // device can take milliseconds to bring up all its endpoints. Giving up early lets
-        // the caller's retry re-issue the SETUP, which RESTARTS the request before the
-        // device can send its ZLP, so it's never caught (the device configures but our
-        // control_out reports Timeout — which a host stack treats as failure). Returns Ok
-        // the instant the ZLP arrives, so a fast device/link is unaffected.
         let mut pkt = [0u8; 8];
-        let mut polls = 0u32;
-        let mut crc_errors = 0u32;
-        let mut got_any_reply = false;
-        while polls < STATUS_POLL_ATTEMPTS && crc_errors < STATUS_CRC_ERROR_BUDGET {
-            polls += 1;
-            match self.in_reply(&in_tok, &mut pkt)? {
-                // The USB 2.0 specification (§8.5.3.1) mandates that the STATUS stage
-                // of a control-write transfer uses a DATA1 PID for the zero-length status packet,
-                // but we accept either DATA0 or DATA1 here to accommodate non-compliant devices
-                // that send DATA0.
-                InReply::Data {
-                    pid: crate::pid::USB_PID_DATA0 | crate::pid::USB_PID_DATA1,
-                    valid_crc: true,
-                    payload_len: 0,
-                } => return Ok(()),
-                InReply::Data {
-                    valid_crc: false, ..
-                } => {
-                    got_any_reply = true;
-                    crc_errors += 1;
-                }
-                InReply::Data { .. } => return Err(PipeError::BadResponse),
-                InReply::Nak => {
-                    got_any_reply = true;
-                }
-                InReply::NoReply => {}
-                InReply::Other => {
-                    return Err(PipeError::BadResponse);
-                }
-            }
-        }
-        if !got_any_reply {
-            Err(PipeError::Disconnected)
-        } else if crc_errors >= STATUS_CRC_ERROR_BUDGET {
-            Err(PipeError::BadResponse)
-        } else {
-            Err(PipeError::Timeout)
+        match self.in_reply(&in_tok, &mut pkt)? {
+            InReply::Data {
+                valid_crc: true,
+                payload_len: 0,
+                ..
+            } => Ok(true),
+            InReply::Data {
+                valid_crc: true, ..
+            } => Err(PipeError::BadResponse),
+            InReply::Nak | InReply::NoReply | InReply::Data { .. } | InReply::Other => Ok(false),
         }
     }
 

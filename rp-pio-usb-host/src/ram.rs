@@ -21,14 +21,14 @@ pub(crate) fn now_us() -> u32 {
 #[cfg(feature = "rp2040")]
 #[inline(always)]
 /// RP2040 hardware timer used by embassy-rp's time driver.
-fn timer() -> pac::timer::Timer {
+pub(crate) fn timer() -> pac::timer::Timer {
     pac::TIMER
 }
 
 #[cfg(any(feature = "rp235xa", feature = "rp235xb"))]
 #[inline(always)]
 /// RP235x timer instance used for the microsecond timebase.
-fn timer() -> pac::timer::Timer {
+pub(crate) fn timer() -> pac::timer::Timer {
     pac::TIMER0
 }
 

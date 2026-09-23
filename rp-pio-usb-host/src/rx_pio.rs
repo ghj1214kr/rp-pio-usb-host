@@ -27,6 +27,11 @@ pub(crate) const IRQ_RX_ALL: u8 = (1 << IRQ_RX_EOP) | (1 << IRQ_RX_START) | (1 <
 /// At full speed it runs at 96 MHz, an 8x oversample of the 12 Mb/s bit rate.
 /// `in_pin` and `jmp_pin` are configured by [`crate::rx_driver::RxDriver`] for
 /// the current speed; the low-speed configuration swaps the sensed lines.
+///
+/// Instruction for instruction Pico-PIO-USB's `usb_edge_detector` (`usb_rx.pio`),
+/// including where the delays sit: `in pins, 1` samples D+ for the EOP check right
+/// after a rising edge, early in the bit, away from the next transition where D+/D-
+/// skew could read as SE0 (a premature EOP).
 pub(crate) fn usb_edge_detector_program() -> Program<32> {
     pio::pio_asm!(
         ".define IRQ_RX_EOP 2",
@@ -40,24 +45,26 @@ pub(crate) fn usb_edge_detector_program() -> Program<32> {
         ".wrap_target",
         "pin_still_low:",
         "    irq DECODER_TRIGGER [1]", // clock the NRZI decoder
+        // resync on rising edge
         "pin_low:",
-        "    jmp pin pin_went_high",
         "    jmp pin pin_went_high",
         "pin_went_low:",
         "    jmp pin pin_went_high",
         "    jmp pin pin_went_high",
         "    jmp pin pin_went_high",
         "    jmp pin pin_went_high",
+        "    jmp pin pin_went_high",
         ".wrap",
         "pin_still_high:",
-        "    mov x, isr [1]",
+        "    mov x, isr [2]",
         "    jmp x-- eop", // both inputs high (inverted) ⇒ SE0 ⇒ EOP
+        // jump here on rising edge
         "pin_went_high:",
-        "    mov isr, null [1]",
-        "    irq DECODER_TRIGGER",
+        "    mov isr, null",
         "    in pins, 1", // capture the pin to check for EOP
+        "    irq DECODER_TRIGGER",
         "    jmp pin pin_still_high",
-        "    jmp pin_went_low",
+        "    jmp pin_went_low", // keeps the decoder trigger interval at 8 cycles
     )
     .program
 }

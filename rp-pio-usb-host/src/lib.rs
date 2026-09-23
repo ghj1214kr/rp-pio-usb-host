@@ -7,6 +7,8 @@ mod clock;
 mod crc;
 mod embassy;
 mod encoding;
+#[cfg(any(feature = "rp235xa", feature = "rp235xb"))]
+mod hw_sof;
 mod pid;
 mod pio_instance;
 mod ram;
@@ -14,7 +16,6 @@ mod rx_driver;
 mod rx_pio;
 mod tx_driver;
 mod tx_pio;
-mod frame_counter;
 
 pub use bus::Pulldown;
 pub use embassy::*;

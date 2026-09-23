@@ -134,6 +134,18 @@ impl<'a, PIO: UsbPioInstance> TxDriver<'a, PIO> {
         }
     }
 
+    /// The state machine configuration for the current speed (program, pins, clock).
+    #[cfg_attr(not(any(feature = "rp235xa", feature = "rp235xb")), allow(dead_code))]
+    pub(crate) fn config(&self) -> &Config<'a, PIO> {
+        &self.txcfg
+    }
+
+    /// `exec` instruction that puts a player at its `start:` slot (current speed).
+    #[cfg_attr(not(any(feature = "rp235xa", feature = "rp235xb")), allow(dead_code))]
+    pub(crate) fn start_instr(&self) -> u16 {
+        self.tx_start_instr
+    }
+
     /// Start driving root-port reset SE0.
     ///
     /// The caller owns the reset duration. USB 2.0 §7.1.7.5 requires at least
