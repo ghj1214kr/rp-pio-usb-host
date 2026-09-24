@@ -21,7 +21,9 @@ const IRQ_TX_EOP_BIT: u8 = 1 << 0;
 const TX_WAIT_TIMEOUT_US: u32 = 50;
 
 /// After the EOP IRQ the player releases the bus within a few cycles (COMP follows
-/// SE0); D+/D- still driven this long after it means something else holds them.
+/// SE0); D+/D- still driven this long after it means something else holds them. (A
+/// safety net: the releases it counted turned out to be interrupts landing in this
+/// wait, and with interrupts off around transactions it has not fired since.)
 const TX_RELEASE_TIMEOUT_US: u32 = 2;
 
 /// TX FIFO capacity when the state machine uses [`FifoJoin::TxOnly`].
@@ -258,8 +260,12 @@ impl<'a, PIO: UsbPioInstance> TxDriver<'a, PIO> {
             self.start_tx();
         } else {
             // Once SM0 starts, prevent a long interrupt from draining the FIFO
-            // before software has queued the rest of the packet.
-            critical_section::with(|_| {
+            // before software has queued the rest of the packet. Interrupts off on this
+            // core only: `critical_section` (a flash-resident call and the cross-core
+            // spinlock, which core 0 may hold) delayed the packet's start by microseconds,
+            // and a DATA packet starting more than ~1 us after its token is dropped by the
+            // device (no handshake).
+            cortex_m::interrupt::free(|_| {
                 self.start_tx();
                 for word in remaining {
                     while ram::pio_sm_tx_full::<PIO, 0>() {}

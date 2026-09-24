@@ -527,14 +527,20 @@ impl<'a, PIO: UsbPioInstance> Bus<'a, PIO> {
 
     /// Send an IN token, catch the device reply, and ACK valid DATA before returning.
     ///
-    /// This spans the TX→RX turnaround (`transmit_for_reply` returns with RX armed, then
+    /// This spans the TX→RX turnaround (`transmit_armed` returns with RX armed, then
     /// `receive_data_and_ack` pre-stages/fires the host ACK), so keep the wrapper itself in
     /// RAM as well as the transmit/receive helpers it calls.
     #[unsafe(link_section = ".data.ram_func")]
     #[inline(never)]
     fn in_reply(&mut self, in_tok: &[u32], pkt: &mut [u8]) -> Result<InReply, PipeError> {
-        self.transmit_for_reply(in_tok, None);
-        let (n, status, ack_sent) = self.receive_data_and_ack(pkt);
+        self.frame_guard_and_service();
+        // No interrupt from the token to the reply (and our ACK): a few microseconds
+        // there and the reply is missed (see `transmit_and_check_ack`).
+        let (n, status, ack_sent) = cortex_m::interrupt::free(|_| {
+            self.frame_guard();
+            self.transmit_armed(in_tok, None);
+            self.receive_data_and_ack(pkt)
+        });
         if status == RxPacketStatus::Overflow {
             self.settle_after_bad_reply();
             return Err(PipeError::Babble);
@@ -597,21 +603,10 @@ impl<'a, PIO: UsbPioInstance> Bus<'a, PIO> {
         self.mark_activity();
     }
 
-    /// Transmit one or two packets, then arm RX for the device reply.
-    ///
-    /// Used for token-only IN transactions and token+DATA OUT/SETUP transactions.
-    #[unsafe(link_section = ".data.ram_func")]
-    #[inline(never)]
-    pub(crate) fn transmit_for_reply(&mut self, first: &[u32], second: Option<&[u32]>) {
-        self.transmit_for_reply_inner(first, second);
-    }
-
-    /// Shared RAM-inlined body for [`transmit_for_reply`](Self::transmit_for_reply)
-    /// and [`transmit_and_check_ack`](Self::transmit_and_check_ack).
+    /// Frame guard and SOF upkeep, before a transaction's token (not between token and
+    /// reply: the reply turnaround is the timing-critical part).
     #[inline(always)]
-    fn transmit_for_reply_inner(&mut self, first: &[u32], second: Option<&[u32]>) {
-        // Before the token, not between token and reply: the reply turnaround is the
-        // timing-critical part.
+    fn frame_guard_and_service(&mut self) {
         if self.hw_sof_active() {
             self.hw_frame_guard();
             self.hw_sof_service();
@@ -619,6 +614,23 @@ impl<'a, PIO: UsbPioInstance> Bus<'a, PIO> {
             self.wait_frame_guard();
             self.sof_if_due();
         }
+    }
+
+    /// The frame guard alone, checked again with interrupts off right before the token:
+    /// an interrupt after [`Self::frame_guard_and_service`] could push the transaction
+    /// over the frame boundary (the host then reads its own SOF as the reply).
+    #[inline(always)]
+    fn frame_guard(&self) {
+        if self.hw_sof_active() {
+            self.hw_frame_guard();
+        } else {
+            self.wait_frame_guard();
+        }
+    }
+
+    /// Arm RX, transmit one or two packets, then let RX catch the reply.
+    #[inline(always)]
+    fn transmit_armed(&mut self, first: &[u32], second: Option<&[u32]>) {
         self.rx.prepare_for_receive();
         self.tx.transmit(first);
         if let Some(second) = second {
@@ -638,9 +650,18 @@ impl<'a, PIO: UsbPioInstance> Bus<'a, PIO> {
         first: &[u32],
         second: Option<&[u32]>,
     ) -> Result<bool, PipeError> {
-        self.transmit_for_reply_inner(first, second);
+        self.frame_guard_and_service();
+        // No interrupt from our packet to the device's handshake: the handshake follows
+        // our EOP within a microsecond, and RX is let loose (`start_receive`) only after
+        // the transmit. The frame-timer interrupt, retrying every 20 us early in the
+        // frame while a transfer holds the bus, landed there tens of times a second:
+        // handshakes were missed, and a retried packet could keep hitting it.
         let mut hbuf = [0u8; 8];
-        let (hlen, _) = self.rx.receive(&mut hbuf);
+        let (hlen, _) = cortex_m::interrupt::free(|_| {
+            self.frame_guard();
+            self.transmit_armed(first, second);
+            self.rx.receive(&mut hbuf)
+        });
         self.mark_activity();
         if hlen < 2 {
             if hlen == 1 {
