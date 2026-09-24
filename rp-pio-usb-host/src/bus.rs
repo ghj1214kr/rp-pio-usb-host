@@ -644,15 +644,24 @@ impl<'a, PIO: UsbPioInstance> Bus<'a, PIO> {
         self.mark_activity();
         if hlen < 2 {
             if hlen == 1 {
+                crate::diag::count(&crate::diag::HS_SHORT);
                 self.settle_after_bad_reply();
+            } else {
+                crate::diag::count(&crate::diag::HS_NO_REPLY);
             }
             return Ok(false);
         }
         match hbuf[1] {
             crate::pid::USB_PID_ACK => Ok(true),
-            crate::pid::USB_PID_STALL => Err(PipeError::Stall),
+            crate::pid::USB_PID_STALL => {
+                crate::diag::count(&crate::diag::HS_STALL);
+                Err(PipeError::Stall)
+            }
             crate::pid::USB_PID_NAK => Ok(false),
-            _ => {
+            other => {
+                crate::diag::count(&crate::diag::HS_OTHER);
+                crate::diag::HS_OTHER_LAST
+                    .store(u32::from(other), core::sync::atomic::Ordering::Relaxed);
                 self.settle_after_bad_reply();
                 Ok(false)
             }

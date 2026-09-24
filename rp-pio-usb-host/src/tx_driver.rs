@@ -20,6 +20,10 @@ const IRQ_TX_EOP_BIT: u8 = 1 << 0;
 /// for a full-size LS packet.
 const TX_WAIT_TIMEOUT_US: u32 = 50;
 
+/// After the EOP IRQ the player releases the bus within a few cycles (COMP follows
+/// SE0); D+/D- still driven this long after it means something else holds them.
+const TX_RELEASE_TIMEOUT_US: u32 = 2;
+
 /// TX FIFO capacity when the state machine uses [`FifoJoin::TxOnly`].
 const TX_FIFO_DEPTH: usize = 8;
 
@@ -213,14 +217,28 @@ impl<'a, PIO: UsbPioInstance> TxDriver<'a, PIO> {
     #[inline(always)]
     pub fn wait(&mut self) {
         let start = ram::now_us();
+        let mut eop = true;
         while PIO::REGS.irq().read().irq() & IRQ_TX_EOP_BIT == 0 {
             if ram::now_us().wrapping_sub(start) > TX_WAIT_TIMEOUT_US {
+                eop = false;
                 break;
             }
         }
+        if !eop {
+            crate::diag::count(&crate::diag::TX_EOP_TIMEOUT);
+        }
+        let release_timeout = if eop {
+            TX_RELEASE_TIMEOUT_US
+        } else {
+            TX_WAIT_TIMEOUT_US
+        };
         let start = ram::now_us();
         while PIO::REGS.dbg_padoe().read() & self.tx_pin_mask != 0 {
-            if ram::now_us().wrapping_sub(start) > TX_WAIT_TIMEOUT_US {
+            if ram::now_us().wrapping_sub(start) > release_timeout {
+                // Still driven after EOP: release by force, or the device's reply
+                // collides with our idle J.
+                crate::diag::count(&crate::diag::TX_BUS_HELD);
+                ram::pio_sm_exec_instr::<PIO, 0>(SET_PINDIRS_IN);
                 break;
             }
         }

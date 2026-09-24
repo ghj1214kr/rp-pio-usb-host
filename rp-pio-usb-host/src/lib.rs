@@ -5,6 +5,7 @@ mod bus;
 mod chip;
 mod clock;
 mod crc;
+pub mod diag;
 mod embassy;
 mod encoding;
 #[cfg(any(feature = "rp235xa", feature = "rp235xb"))]
