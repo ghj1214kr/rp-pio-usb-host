@@ -158,12 +158,15 @@ impl<'a, PIO: UsbPioInstance> TxDriver<'a, PIO> {
         }
     }
 
-    /// Release the bus after reset by driving idle J and re-enabling the TX player.
+    /// End the reset: drive idle J, then release the bus to the device's pull-up.
+    ///
+    /// SM0 stays disabled until the next packet (see [`Self::wait`]): enabled with an
+    /// empty FIFO it would keep driving J and override the hardware SOF state machine.
     pub fn release_reset(&mut self) {
         unsafe {
             self.tx_sm.exec_instr(self.tx_start_instr);
+            self.tx_sm.exec_instr(SET_PINDIRS_IN);
         }
-        self.tx_sm.set_enable(true);
     }
 
     /// Release D+/D- to inputs so the device or pull-up can drive the bus.
@@ -221,6 +224,10 @@ impl<'a, PIO: UsbPioInstance> TxDriver<'a, PIO> {
                 break;
             }
         }
+        // A parked (stalled) SM0 keeps asserting its side-set on the shared pins, which
+        // overrides the hardware SOF state machine between its own writes. The next
+        // packet restarts and re-enables SM0 anyway.
+        ram::pio_sm_disable::<PIO, 0>();
     }
 
     /// Transmit a pre-encoded packet from RAM-resident code.
